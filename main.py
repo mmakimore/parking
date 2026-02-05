@@ -4,20 +4,22 @@ ParkingBot - Telegram-бот для аренды парковочных мест
 """
 import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 
-from config import BOT_TOKEN, LOG_LEVEL, LOG_FORMAT
+from config import BOT_TOKEN, DATABASE_PATH
 import database as db
 from user_handlers import router as user_router
 from admin_handlers import router as admin_router
 
 # Настройка логирования
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format=LOG_FORMAT
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -25,133 +27,69 @@ logger = logging.getLogger(__name__)
 bot_instance: Bot = None
 
 
+async def set_bot_commands(bot: Bot):
+    """Установка команд бота"""
+    commands = [
+        BotCommand(command="start", description="🚀 Начать работу"),
+        BotCommand(command="admin", description="👑 Админ-панель"),
+        BotCommand(command="help", description="❓ Помощь"),
+    ]
+    await bot.set_my_commands(commands)
+
+
 async def cleanup_old_data():
-    """Очистка старых данных (бронирования старше 30 дней)"""
+    """Очистка старых данных"""
     try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Помечаем старые бронирования как завершённые
-            cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute('''
-                UPDATE bookings 
-                SET status = 'completed' 
-                WHERE status = 'confirmed' AND end_time < ?
-            ''', (cutoff,))
-            
-            # Удаляем старые слоты доступности
-            cursor.execute('''
-                DELETE FROM spot_availability 
-                WHERE end_time < ? AND is_booked = 0
-            ''', (cutoff,))
-            
-            # Деактивируем старые уведомления
-            cursor.execute('''
-                UPDATE spot_notifications 
-                SET is_active = 0 
-                WHERE desired_date < DATE('now', '-7 days')
-            ''')
-            
-            logger.info("Old data cleanup completed")
+        # Создаем новое соединение для каждой задачи
+        connection = db.Database(DATABASE_PATH)
+        
+        # Помечаем старые бронирования как завершённые
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Используем существующие методы базы данных
+        all_bookings = connection.get_all_bookings(limit=1000)
+        for booking in all_bookings:
+            if booking['status'] == 'confirmed':
+                booking_time = datetime.fromisoformat(booking['end_time'])
+                if booking_time < datetime.now() - timedelta(days=30):
+                    connection.update_booking_status(booking['id'], 'completed')
+        
+        logger.info("Old data cleanup completed")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
 
 async def check_pending_bookings():
-    """Проверка просроченных бронирований (не оплачены за 24 часа)"""
+    """Проверка просроченных бронирований"""
     try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Находим бронирования старше 24 часов в статусе pending
-            cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute('''
-                SELECT b.id, b.availability_id, b.customer_id, b.spot_id,
-                       u.telegram_id as customer_telegram_id,
-                       ps.spot_number
-                FROM bookings b
-                JOIN users u ON b.customer_id = u.id
-                JOIN parking_spots ps ON b.spot_id = ps.id
-                WHERE b.status = 'pending' AND b.created_at < ?
-            ''', (cutoff,))
-            
-            expired_bookings = cursor.fetchall()
-            
-            for booking in expired_bookings:
+        connection = db.Database(DATABASE_PATH)
+        
+        # Находим бронирования старше 24 часов в статусе pending
+        all_bookings = connection.get_all_bookings(status='pending', limit=1000)
+        
+        for booking in all_bookings:
+            created_time = datetime.fromisoformat(booking['created_at'])
+            if created_time < datetime.now() - timedelta(hours=24):
                 # Отменяем бронирование
-                cursor.execute('''
-                    UPDATE bookings SET status = 'cancelled' WHERE id = ?
-                ''', (booking['id'],))
-                
-                # Освобождаем слот
-                cursor.execute('''
-                    UPDATE spot_availability 
-                    SET is_booked = 0, booked_by = NULL, booking_id = NULL
-                    WHERE id = ?
-                ''', (booking['availability_id'],))
+                connection.update_booking_status(booking['id'], 'cancelled')
                 
                 # Уведомляем пользователя
                 if bot_instance:
                     try:
                         await bot_instance.send_message(
-                            booking['customer_telegram_id'],
+                            booking.get('customer_telegram_id', 0),
                             f"❌ <b>Бронирование отменено</b>\n\n"
-                            f"Ваше бронирование места {booking['spot_number']} "
-                            f"было автоматически отменено из-за отсутствия оплаты в течение 24 часов.",
+                            f"Бронирование #{booking['id']} отменено из-за отсутствия оплаты в течение 24 часов.",
                             parse_mode="HTML"
                         )
                     except Exception as e:
                         logger.error(f"Failed to notify about expired booking: {e}")
-            
-            if expired_bookings:
-                logger.info(f"Cancelled {len(expired_bookings)} expired bookings")
+        
+        if all_bookings:
+            logger.info(f"Checked {len(all_bookings)} pending bookings")
                 
     except Exception as e:
         logger.error(f"Pending bookings check error: {e}")
-
-
-async def send_booking_reminders():
-    """Отправка напоминаний о предстоящих бронированиях (за 1 час)"""
-    try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Находим бронирования, которые начнутся через 1-2 часа
-            now = datetime.now()
-            in_1_hour = (now + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-            in_2_hours = (now + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-            
-            cursor.execute('''
-                SELECT b.id, b.start_time, b.end_time, b.total_price,
-                       u.telegram_id as customer_telegram_id,
-                       ps.spot_number,
-                       supplier.full_name as supplier_name
-                FROM bookings b
-                JOIN users u ON b.customer_id = u.id
-                JOIN parking_spots ps ON b.spot_id = ps.id
-                JOIN users supplier ON ps.supplier_id = supplier.id
-                WHERE b.status = 'confirmed' 
-                AND b.start_time BETWEEN ? AND ?
-            ''', (in_1_hour, in_2_hours))
-            
-            upcoming = cursor.fetchall()
-            
-            for booking in upcoming:
-                if bot_instance:
-                    try:
-                        start = datetime.fromisoformat(booking['start_time'])
-                        await bot_instance.send_message(
-                            booking['customer_telegram_id'],
-                            f"⏰ <b>Напоминание!</b>\n\n"
-                            f"Ваше бронирование места {booking['spot_number']} "
-                            f"начнётся через ~1 час ({start.strftime('%H:%M')}).",
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to send reminder: {e}")
-                        
-    except Exception as e:
-        logger.error(f"Reminders error: {e}")
 
 
 async def background_tasks():
@@ -162,7 +100,6 @@ async def background_tasks():
             
             await cleanup_old_data()
             await check_pending_bookings()
-            await send_booking_reminders()
             
         except asyncio.CancelledError:
             logger.info("Background tasks cancelled")
@@ -180,8 +117,12 @@ async def on_startup(bot: Bot):
     logger.info("Bot is starting...")
     
     # Инициализация БД
-    db.init_database()
+    db_instance = db.Database(DATABASE_PATH)
+    db_instance.init_database()
     logger.info("Database initialized")
+    
+    # Установка команд бота
+    await set_bot_commands(bot)
     
     # Получаем информацию о боте
     bot_info = await bot.get_me()
@@ -201,12 +142,15 @@ async def main():
     """Главная функция запуска бота"""
     
     # Проверяем токен
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         logger.error("Bot token is not set! Please set BOT_TOKEN in .env file")
-        return
+        print("❌ ОШИБКА: Токен бота не установлен!")
+        print("👉 Зайдите в BotHost -> Настройки бота -> Переменные окружения")
+        print("👉 Добавьте переменную: BOT_TOKEN=ваш_токен_от_BotFather")
+        sys.exit(1)
     
     # Создаём бота и диспетчер
-    bot = Bot(token=BOT_TOKEN, default={"parse_mode": ParseMode.HTML})
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)  # ИСПРАВЛЕНО: убрано default=
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
     
@@ -230,4 +174,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot startup error: {e}")
