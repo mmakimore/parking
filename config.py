@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Telegram Bot Token
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8371063652:AAGWaqWPxKgtp8oSCPp18mzaWiA1GY5gRQo")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 # Database
 DATABASE_PATH = os.getenv("DATABASE_PATH", "parking.db")
